@@ -3,6 +3,7 @@
 mod boolean_rle;
 mod float;
 mod rle_v2;
+mod util;
 mod variable_length;
 
 pub use boolean_rle::{BooleanIter, BooleanRleRunIter, BooleanRun};

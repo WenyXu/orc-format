@@ -1,6 +1,11 @@
 use std::io::Read;
 
-use crate::error::Error;
+use crate::{
+    error::Error,
+    read::decode::util::{get_closest_fixed_bits, read_ints},
+};
+
+use super::util::{bytes_to_long_be, read_byte};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EncodingTypeV2 {
@@ -20,12 +25,7 @@ fn header_to_rle_v2_short_repeated_count(header: u8) -> u8 {
 
 fn rle_v2_direct_bit_width(value: u8) -> u8 {
     match value {
-        0 => 1,
-        1 => 2,
-        3 => 4,
-        7 => 8,
-        15 => 16,
-        23 => 24,
+        0..=23 => value + 1,
         27 => 32,
         28 => 40,
         29 => 48,
@@ -107,7 +107,7 @@ fn unpack(bytes: &[u8], num_bits: u8, index: usize) -> u64 {
         return 0;
     };
     let num_bits = num_bits as usize;
-    let start = num_bits * index; // in bits
+    let start: usize = num_bits * index; // in bits
     let length = num_bits; // in bits
     let byte_start = start / 8;
     let byte_end = (start + length + 7) / 8;
@@ -120,6 +120,153 @@ fn unpack(bytes: &[u8], num_bits: u8, index: usize) -> u64 {
     let bits = u64::from_le_bytes(a);
     let offset = (slice.len() * 8 - num_bits) % 8 - start % 8;
     (bits >> offset) & (!0u64 >> (64 - num_bits))
+}
+
+#[derive(Debug)]
+pub struct UnsignedPatchedBaseRun {
+    length: usize,
+    index: usize,
+    data: Vec<i64>,
+}
+
+impl UnsignedPatchedBaseRun {
+    #[inline]
+    pub fn try_new<R: Read>(header: u8, reader: &mut R, skip_corrupt: bool) -> Result<Self, Error> {
+        let bit_width = header_to_rle_v2_direct_bit_width(header);
+
+        // 9 bits for length (L) (1 to 512 values)
+        let second_byte = read_byte(reader);
+
+        let mut length = (header as i32 & 0x01 << 8) as usize | second_byte as usize;
+        // runs are one off
+        length += 1;
+
+        let third_byte = read_byte(reader);
+
+        let mut base_width = third_byte as u64 >> 5 & 0x07;
+        // base width is one off
+        base_width += 1;
+
+        let patch_width = rle_v2_direct_bit_width(third_byte & 0x1f);
+
+        // reads next
+        let fourth_byte = read_byte(reader);
+
+        let mut patch_gap_width = fourth_byte as u64 >> 5 & 0x07;
+        // patch gap width is one off
+        patch_gap_width += 1;
+
+        // extracts the length of the patch list
+        let patch_list_length = fourth_byte & 0x1f;
+
+        let mut base = bytes_to_long_be(reader, base_width as usize)?;
+
+        let mask = 1i64 << (base_width * 8) - 1;
+        // if MSB of base value is 1 then base is negative value else positive
+        if base & mask != 0 {
+            base = base & !mask;
+            base = -base
+        }
+
+        let mut unpacked = vec![0i64; length];
+
+        read_ints(&mut unpacked, 0, length, bit_width as usize, reader)?;
+
+        let mut unpacked_patch = vec![0i64; patch_list_length as usize];
+
+        let width = patch_width as usize + patch_gap_width as usize;
+
+        if width > 64 && !skip_corrupt {
+            // TODO: throw error
+        }
+
+        let bit_size = get_closest_fixed_bits(width);
+
+        read_ints(
+            &mut unpacked_patch,
+            0,
+            patch_list_length as usize,
+            bit_size,
+            reader,
+        )?;
+
+        let mut patch_index = 0;
+        let patch_mask = ((1 << patch_width) - 1);
+        let mut current_gap = ((unpacked_patch[patch_index] as u64) >> patch_width) as i64;
+        let mut current_patch = unpacked_patch[patch_index] & patch_mask;
+        let mut actual_gap = 0i64;
+
+        let mut literals = vec![];
+        let mut num_literals = 0;
+
+        while current_gap == 255 && current_patch == 0 {
+            actual_gap += 255;
+            patch_index += 1;
+            current_gap = ((unpacked_patch[patch_index] as u64) >> patch_width) as i64;
+            current_patch = unpacked_patch[patch_index] & patch_mask;
+        }
+        actual_gap += current_gap;
+
+        for i in 0..unpacked.len() {
+            if i == actual_gap as usize {
+                let patched_value = unpacked[i] | (current_patch << bit_width);
+
+                literals.push(base + patched_value);
+                num_literals += 1;
+
+                patch_index += 1;
+
+                if patch_index < unpacked_patch.len() {
+                    current_gap = ((unpacked_patch[patch_index] as u64) >> patch_width) as i64;
+                    current_patch = unpacked_patch[patch_index] & patch_mask;
+                    actual_gap = 0;
+
+                    while current_gap == 255 && current_patch == 0 {
+                        actual_gap += 255;
+                        patch_index += 1;
+                        current_gap = ((unpacked_patch[patch_index] as u64) >> patch_width) as i64;
+                        current_patch = unpacked_patch[patch_index] & patch_mask;
+                    }
+
+                    actual_gap += current_gap;
+                    actual_gap += i as i64;
+                }
+            } else {
+                literals.push(base + unpacked[i]);
+                num_literals += 1;
+            }
+        }
+
+        Ok(Self {
+            length: num_literals,
+            index: 0,
+            data: literals,
+        })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.length - self.index
+    }
+}
+
+impl Iterator for UnsignedPatchedBaseRun {
+    type Item = u64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.index != self.length).then(|| {
+            let index = self.index;
+            self.index += 1;
+            self.data[index] as u64
+        })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len();
+        (remaining, Some(remaining))
+    }
 }
 
 #[derive(Debug)]
@@ -812,5 +959,23 @@ mod test {
             .unwrap()
             .collect::<Vec<_>>();
         assert_eq!(a, vec![2, 3, 5, 7, 11, 13, 17, 19, 23, 29]);
+    }
+
+    #[test]
+    fn patched_base() {
+        let data = vec![
+            0x8eu8, 0x09, 0x2b, 0x21, 0x07, 0xd0, 0x1e, 0x00, 0x14, 0x70, 0x28, 0x32, 0x3c, 0x46,
+            0x50, 0x5a, 0xfc, 0xe8,
+        ];
+
+        let expected = vec![
+            2030u64, 2000, 2020, 1000000, 2040, 2050, 2060, 2070, 2080, 2090,
+        ];
+
+        let a = UnsignedPatchedBaseRun::try_new(data[0], &mut &data[1..], false)
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        assert_eq!(a, expected);
     }
 }

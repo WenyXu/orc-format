@@ -1,3 +1,4 @@
+use chrono::{Days, NaiveDate, NaiveDateTime};
 use orc_format::{
     error::Error,
     proto::{column_encoding::Kind as ColumnEncodingKind, stream::Kind},
@@ -219,4 +220,101 @@ pub fn deserialize_str_array(column: &Column) -> Result<(Vec<bool>, Vec<String>)
         other => todo!("{other:?}"),
     };
     Ok((validity, valid_values))
+}
+
+//  TIMESTAMP_BASE is 1 January 2015, the base value for all timestamp values.
+const TIMESTAMP_BASE: i64 = 1420070400;
+
+pub fn deserialize_timestamp_columns(
+    column: &Column,
+) -> Result<(Vec<bool>, Vec<NaiveDateTime>), Error> {
+    let mut scratch = vec![];
+
+    let validity = deserialize_validity(column, &mut scratch)?;
+    let num_of_values: usize = validity.iter().map(|x| *x as usize).sum();
+
+    // DATA
+    let reader = column.get_stream(Kind::Data, scratch.clone())?;
+
+    let mut data_values = Vec::with_capacity(num_of_values);
+
+    let mut iter = SignedRleV2RunIter::new(reader, num_of_values, vec![]);
+
+    iter.try_for_each(|run| {
+        run.map(|run| match run {
+            SignedRleV2Run::Direct(values) => data_values.extend(values),
+            SignedRleV2Run::Delta(values) => data_values.extend(values),
+            SignedRleV2Run::ShortRepeat(values) => data_values.extend(values),
+        })
+    })?;
+
+    let (_, _) = iter.into_inner();
+
+    // SECONDARY
+    let reader = column.get_stream(Kind::Secondary, scratch)?;
+
+    let mut secondary_values = Vec::with_capacity(num_of_values);
+    let mut iter = UnsignedRleV2RunIter::new(reader, num_of_values, vec![]);
+
+    iter.try_for_each(|run| {
+        run.map(|run| match run {
+            UnsignedRleV2Run::Direct(values) => secondary_values.extend(values),
+            UnsignedRleV2Run::Delta(values) => secondary_values.extend(values),
+            UnsignedRleV2Run::ShortRepeat(values) => secondary_values.extend(values),
+        })
+    })?;
+    let (_, _) = iter.into_inner();
+
+    let mut date = Vec::with_capacity(validity.len());
+
+    for (idx, data) in data_values.into_iter().enumerate() {
+        let mut nanos = secondary_values[idx];
+        let zeros = nanos & 0x7;
+        nanos >>= 3;
+        if zeros != 0 {
+            for _ in 0..=zeros {
+                nanos *= 10;
+            }
+        }
+        date.push(NaiveDateTime::from_timestamp_opt(data + TIMESTAMP_BASE, nanos as u32).unwrap());
+    }
+
+    Ok((validity, date))
+}
+
+pub fn deserialize_date_columns(column: &Column) -> Result<(Vec<bool>, Vec<NaiveDate>), Error> {
+    let mut scratch = vec![];
+
+    let validity = deserialize_validity(column, &mut scratch)?;
+    let num_of_values: usize = validity.iter().map(|x| *x as usize).sum();
+
+    // DATA
+    let reader = column.get_stream(Kind::Data, scratch.clone())?;
+
+    let mut data_values = Vec::with_capacity(num_of_values);
+
+    let mut iter = SignedRleV2RunIter::new(reader, num_of_values, vec![]);
+
+    iter.try_for_each(|run| {
+        run.map(|run| match run {
+            SignedRleV2Run::Direct(values) => data_values.extend(values),
+            SignedRleV2Run::Delta(values) => data_values.extend(values),
+            SignedRleV2Run::ShortRepeat(values) => data_values.extend(values),
+        })
+    })?;
+
+    let (_, _) = iter.into_inner();
+
+    let mut date = Vec::with_capacity(validity.len());
+
+    for (_, data) in data_values.into_iter().enumerate() {
+        date.push(
+            NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .checked_add_days(Days::new(data as u64))
+                .unwrap(),
+        );
+    }
+
+    Ok((validity, date))
 }

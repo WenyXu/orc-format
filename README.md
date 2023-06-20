@@ -21,11 +21,9 @@ It currently reads the following (logical) types:
 What is not yet implemented:
 
 * Snappy, LZO decompression
-* RLE v2 `Patched Base` decoding
 * RLE v1 decoding
 * Utility functions to decode non-native logical types:
     * decimal
-    * timestamp
     * struct
     * List
     * Union

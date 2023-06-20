@@ -314,3 +314,36 @@ fn read_string_decrease() -> Result<(), Error> {
     assert_eq!(b, vec!["eeeee", "dddd", "ccc", "bb", "a"]);
     Ok(())
 }
+
+#[test]
+fn read_timestamp_simple() -> Result<(), Error> {
+    let column = get_column("test.orc", 18)?;
+
+    let (a, b) = deserialize_timestamp_columns(&column)?;
+    assert_eq!(a, vec![true; 5]);
+
+    assert_eq!(
+        "1680380130002000000,1629617204525777000,1672531200000000000,1675209600000000000,1677628800000000000",
+        b.into_iter()
+        .map(|v| format!("{}", v.timestamp_nanos()))
+        .collect::<Vec<_>>()
+        .join(",")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn read_date_simple() -> Result<(), Error> {
+    let column = get_column("test.orc", 19)?;
+
+    let (a, b) = deserialize_date_columns(&column)?;
+    assert_eq!(a, vec![true; 5]);
+
+    assert_eq!(
+        "[2023-04-01, 2023-03-01, 2023-01-01, 2023-02-01, 2023-03-01]",
+        format!("{:?}", b),
+    );
+
+    Ok(())
+}
