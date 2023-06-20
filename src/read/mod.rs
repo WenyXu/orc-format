@@ -50,15 +50,17 @@ where
     let file_len = stream_len(reader)?;
 
     // initial read of the footer
-    let footer_len = if file_len < DEFAULT_FOOTER_SIZE {
+    let assume_footer_len = if file_len < DEFAULT_FOOTER_SIZE {
         file_len
     } else {
         DEFAULT_FOOTER_SIZE
     };
 
-    reader.seek(SeekFrom::End(-(footer_len as i64)))?;
-    let mut tail_bytes = Vec::with_capacity(footer_len as usize);
-    reader.take(footer_len).read_to_end(&mut tail_bytes)?;
+    reader.seek(SeekFrom::End(-(assume_footer_len as i64)))?;
+    let mut tail_bytes = Vec::with_capacity(assume_footer_len as usize);
+    reader
+        .take(assume_footer_len)
+        .read_to_end(&mut tail_bytes)?;
 
     // The final byte of the file contains the serialized length of the Postscript,
     // which must be less than 256 bytes.
@@ -72,14 +74,23 @@ where
     // next is the footer
     let footer_length = postscript.footer_length.ok_or(Error::OutOfSpec)? as usize; // todo: throw error
 
-    let footer = &tail_bytes[tail_bytes.len() - footer_length..];
-    let footer = deserialize_footer(footer, postscript.compression())?;
-    tail_bytes.truncate(tail_bytes.len() - footer_length);
+    let footer_offset = file_len - footer_length as u64 - postscript_len as u64 - 1;
+
+    reader.seek(SeekFrom::Start(footer_offset))?;
+    let mut footer = vec![0; footer_length];
+    let _ = reader.read_exact(&mut footer);
+    let footer = deserialize_footer(&footer, postscript.compression())?;
 
     // finally the metadata
     let metadata_length = postscript.metadata_length.ok_or(Error::OutOfSpec)? as usize; // todo: throw error
-    let metadata = &tail_bytes[tail_bytes.len() - metadata_length..];
-    let metadata = deserialize_footer_metadata(metadata, postscript.compression())?;
+    let metadata_offset =
+        file_len - metadata_length as u64 - footer_length as u64 - postscript_len as u64 - 1;
+
+    let _ = reader.seek(SeekFrom::Start(metadata_offset))?;
+    let mut metadata = vec![0; metadata_length];
+    let _ = reader.read_exact(&mut metadata);
+
+    let metadata = deserialize_footer_metadata(&metadata, postscript.compression())?;
 
     Ok(FileMetadata {
         postscript,

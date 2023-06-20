@@ -1,6 +1,7 @@
 use std::fs::File;
 
 mod deserialize;
+mod example;
 use deserialize::*;
 
 use orc_format::{error::Error, read, read::Column};
